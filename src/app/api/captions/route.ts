@@ -33,6 +33,12 @@ const requiredResponseKeys = [
   "safetyNote",
 ] as const;
 
+type CaptionTextField =
+  | "formal"
+  | "sarcastic"
+  | "humorousTech"
+  | "humorousNonTech";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -178,7 +184,10 @@ function readStringField(value: Record<string, unknown>, aliases: string[]) {
   return "";
 }
 
-function normalizeCaptionResponse(value: unknown): FireworksCaptionResponse {
+function normalizeCaptionResponse(
+  value: unknown,
+  payload?: CaptionRequestPayload,
+): FireworksCaptionResponse {
   if (!isRecord(value)) {
     throw new Error("Model JSON response must be an object.");
   }
@@ -223,10 +232,68 @@ function normalizeCaptionResponse(value: unknown): FireworksCaptionResponse {
     }
   }
 
-  return sanitizeCaptionResponse(response);
+  return sanitizeCaptionResponse(response, payload);
 }
 
-function sanitizeCaptionText(text: string) {
+function contextAllowsAudioClaims(context?: string) {
+  if (!context) {
+    return false;
+  }
+
+  return (
+    /\b(transcript|audio|voice|vocal|vocals|singing|sang|sung|song|lyrics?|pitch|speech|spoken|speaking|said|says|dialogue|narration|microphone|mic)\b/i.test(
+      context,
+    ) || /\bsound quality\b/i.test(context)
+  );
+}
+
+function hasUnsupportedAudioClaim(text: string, allowAudioClaims: boolean) {
+  if (allowAudioClaims) {
+    return false;
+  }
+
+  const unsupportedAudioPatterns = [
+    /\bvoice(?:s)?\b/i,
+    /\bpitch(?:es|ed)?\b/i,
+    /\bvocal(?:s|ly)?\b/i,
+    /\bsing(?:er|ing|s)?\b/i,
+    /\bsang\b/i,
+    /\bsung\b/i,
+    /\blyric(?:s)?\b/i,
+    /\baudio\b/i,
+    /\bsound(?:ed|s|ing)?\b/i,
+    /\bspeech\b/i,
+    /\bspoken\b/i,
+    /\bspeaking\b/i,
+    /\bhear(?:d|ing)?\b/i,
+    /\blisten(?:ed|ing)?\b/i,
+    /\bmicrophone\b/i,
+    /\bmic\b/i,
+  ];
+
+  return unsupportedAudioPatterns.some((pattern) => pattern.test(text));
+}
+
+function rewriteUnsupportedAudioCaption(field: CaptionTextField) {
+  const replacements: Record<CaptionTextField, string> = {
+    formal: "A confident on-camera moment, ready for a polished caption.",
+    sarcastic: "That stage presence really showed up like it had a booking.",
+    humorousTech: "Stage presence deployed. Confidence running at full speed.",
+    humorousNonTech: "This moment walked in ready for the spotlight.",
+  };
+
+  return replacements[field];
+}
+
+function sanitizeCaptionText({
+  allowAudioClaims = false,
+  field,
+  text,
+}: {
+  allowAudioClaims?: boolean;
+  field: CaptionTextField;
+  text: string;
+}) {
   const metaPatterns = [
     /\bwe are asked to generate captions?\b/gi,
     /\bbased on (the )?(provided )?(context|transcript)\b[:,]?\s*/gi,
@@ -261,6 +328,10 @@ function sanitizeCaptionText(text: string) {
     return "A short, share-ready moment with room for your final review.";
   }
 
+  if (hasUnsupportedAudioClaim(normalized, allowAudioClaims)) {
+    return rewriteUnsupportedAudioCaption(field);
+  }
+
   const sentences = normalized
     .split(/(?<=[.!?])\s+/)
     .filter(Boolean)
@@ -274,18 +345,40 @@ function sanitizeCaptionText(text: string) {
 
 function sanitizeCaptionResponse(
   response: FireworksCaptionResponse,
+  payload?: CaptionRequestPayload,
 ): FireworksCaptionResponse {
+  const allowAudioClaims = contextAllowsAudioClaims(payload?.context);
+
   return {
-    formal: sanitizeCaptionText(response.formal),
-    sarcastic: sanitizeCaptionText(response.sarcastic),
-    humorousTech: sanitizeCaptionText(response.humorousTech),
-    humorousNonTech: sanitizeCaptionText(response.humorousNonTech),
+    formal: sanitizeCaptionText({
+      allowAudioClaims,
+      field: "formal",
+      text: response.formal,
+    }),
+    sarcastic: sanitizeCaptionText({
+      allowAudioClaims,
+      field: "sarcastic",
+      text: response.sarcastic,
+    }),
+    humorousTech: sanitizeCaptionText({
+      allowAudioClaims,
+      field: "humorousTech",
+      text: response.humorousTech,
+    }),
+    humorousNonTech: sanitizeCaptionText({
+      allowAudioClaims,
+      field: "humorousNonTech",
+      text: response.humorousNonTech,
+    }),
     visualSummary: response.visualSummary.trim(),
     safetyNote: response.safetyNote.trim(),
   };
 }
 
-function parseCaptionResponse(rawText: string): FireworksCaptionResponse | null {
+function parseCaptionResponse(
+  rawText: string,
+  payload?: CaptionRequestPayload,
+): FireworksCaptionResponse | null {
   const withoutFence = stripCodeFences(rawText);
   const startIndexes: number[] = [];
   const endIndexes: number[] = [];
@@ -308,7 +401,7 @@ function parseCaptionResponse(rawText: string): FireworksCaptionResponse | null 
 
       try {
         const parsed = JSON.parse(withoutFence.slice(startIndex, endIndex + 1));
-        return normalizeCaptionResponse(parsed);
+        return normalizeCaptionResponse(parsed, payload);
       } catch {
         // Keep scanning for a smaller valid JSON object inside model prose.
       }
@@ -354,17 +447,20 @@ function buildTextCaptionsFromRawResponse({
 }): FireworksCaptionResponse {
   const subject = contextSubject(payload);
 
-  return sanitizeCaptionResponse({
+  return sanitizeCaptionResponse(
+    {
     formal: firstUsefulSentence(rawText),
     sarcastic: `Sure, because ${subject} clearly needed a caption with dramatic timing.`,
     humorousTech:
-      "Caption engine warmed up, drama skipped, share button ready.",
+      "Confidence compiled successfully.",
     humorousNonTech: `${subject} brought the moment; the backup caption brought the punchline.`,
     visualSummary:
       "Generated from user-provided context because the vision model is unavailable for this workspace.",
     safetyNote:
       "Generated from user-provided context because the vision model is unavailable for this workspace. Review captions before publishing.",
-  });
+    },
+    payload,
+  );
 }
 
 function describeVideo({
@@ -416,13 +512,16 @@ Caption rules:
 - Each caption should be 1-2 short sentences max.
 - Formal: polished and professional.
 - Sarcastic: witty but not offensive or cruel.
-- Humorous-tech: funny using technology/dev/AI language without claiming fake audio/video analysis.
+- Humorous-tech: funny using technology/dev/AI language without claiming fake audio, voice, pitch, singing, vocal, or sound analysis.
+- Good humorous-tech examples: "Stage presence deployed. Confidence running at full speed.", "This audition clip passed the vibe check with zero loading time.", "Confidence compiled successfully."
 - Humorous-non-tech: funny for a general audience.
 - Do not invent facts not visible in the frames or provided context.
 - If evidence is unclear, keep captions generic and put limitations only in visualSummary or safetyNote.
 - Do not identify private people by name unless the user provided names in context.
-- Do not say you analyzed audio, pitch, voice, identity, or hidden video details unless explicitly provided in the context.
-- Do not claim emotion detection, identity recognition, speech analysis, or confidence scores unless explicitly provided in the context.
+- The app analyzes sampled video frames, not audio.
+- Do not claim voice quality, pitch, singing quality, vocal performance, audio analysis, sound quality, lyrics, speech, tone, or anything heard unless explicitly provided in the context/transcript.
+- Do not say you analyzed audio, pitch, voice, identity, or hidden video details unless explicitly provided in the context/transcript.
+- Do not claim emotion detection, identity recognition, speech analysis, audio confidence, vocal confidence, or confidence scores unless explicitly provided in the context/transcript.
 - Avoid hateful, sexual, violent, or harmful content.
 - Keep captions safe for public posting.`;
 }
@@ -436,7 +535,9 @@ Vision-specific rules:
 - Do not infer religion, ethnicity, nationality, age, identity, beliefs, background, or personal details unless the user explicitly provides them in the context/transcript.
 - You may say "woman wearing a hijab" only if clearly visible. Do not say "Muslim woman" unless the user explicitly provides that.
 - Do not guess age, ethnicity, nationality, religion, personal identity, or background.
-- If audio/transcript is not provided, do not claim to understand lyrics, speech, pitch, tone, or voice.
+- This app analyzes sampled frames only; it does not analyze audio.
+- Unless the user context/transcript explicitly provides audio details, do not mention voice quality, pitch, singing quality, vocal performance, audio analysis, sound quality, lyrics, speech, tone, vocals, or anything heard.
+- Do not turn visible performance into audio claims. Prefer visual/performance-safe wording such as "Stage presence deployed" or "Confidence compiled successfully."
 - Avoid saying "based on the context", "based on the frames", "the model sees", "AI generated", "Fireworks", or any task/meta language inside caption fields.
 - Captions should be engaging and natural, not robotic.
 - visualSummary should honestly summarize visible scene/action and provided context only.
@@ -454,12 +555,13 @@ function createTextFallbackPrompt(payload: CaptionRequestPayload) {
 - video duration
 
 You cannot see video frames in this fallback path. Do not pretend you analyzed frames, previews, audio, voice, pitch, hidden content, identities, emotions, or visual details.
-Do not say you analyzed audio, pitch, voice, identity, or hidden video details unless explicitly provided in the context.
-Do not claim emotion detection, identity recognition, speech analysis, audio analysis, pitch detection, or confidence scores.
+Do not say you analyzed audio, pitch, voice, identity, or hidden video details unless explicitly provided in the context/transcript.
+Do not claim voice quality, pitch, singing quality, vocal performance, audio analysis, sound quality, lyrics, speech, tone, or anything heard unless explicitly provided in the context/transcript.
+Do not claim emotion detection, identity recognition, speech analysis, audio analysis, pitch detection, audio confidence, vocal confidence, or confidence scores.
 The four caption fields must be clean, short, social-media-ready captions only.
 Do not put meta or prompt language in the four captions. Forbidden caption wording includes: "we are asked", "based on the context", "based on the frames", "limited context", "filename", "frame timestamps", "vision model unavailable", "Fireworks", "AI generated", "the model", "the prompt", "as an AI", and any explanation of this task.
 Put technical limitations only in visualSummary and safetyNote.
-Keep humorous-tech funny but honest, for example: "Caption engine warmed up, drama skipped, share button ready."
+Keep humorous-tech funny but honest and visual/performance-safe, for example: "Stage presence deployed. Confidence running at full speed.", "This audition clip passed the vibe check with zero loading time.", or "Confidence compiled successfully."
 Set visualSummary to: "Generated from user-provided context because the vision model is unavailable for this workspace."
 Set safetyNote to: "Generated from user-provided context because the vision model is unavailable for this workspace. Review captions before publishing."
 If the available context is thin, keep the captions generic and natural without saying "limited context".
@@ -565,17 +667,19 @@ async function createCaptionCompletion({
   client,
   content,
   model,
+  payload,
 }: {
   client: OpenAI;
   content: string | ChatCompletionContentPart[];
   model: string;
+  payload: CaptionRequestPayload;
 }) {
   const rawText = await createCaptionCompletionText({
     client,
     content,
     model,
   });
-  const parsed = parseCaptionResponse(rawText);
+  const parsed = parseCaptionResponse(rawText, payload);
 
   if (!parsed) {
     throw new Error("Model response did not include a JSON object.");
@@ -621,6 +725,7 @@ async function generateVisionCaptions({
     client,
     content,
     model,
+    payload,
   });
 }
 
@@ -642,7 +747,7 @@ async function generateTextFallbackCaptions({
   logRawModelOutput("Fireworks text fallback raw output:", rawText);
 
   return (
-    parseCaptionResponse(rawText) ||
+    parseCaptionResponse(rawText, payload) ||
     buildTextCaptionsFromRawResponse({
       payload,
       rawText,
