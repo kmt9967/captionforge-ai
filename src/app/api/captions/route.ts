@@ -463,23 +463,6 @@ function buildTextCaptionsFromRawResponse({
   );
 }
 
-function describeVideo({
-  context,
-  frames,
-  videoDuration,
-  videoFileName,
-}: CaptionRequestPayload) {
-  const frameTimestamps = frames
-    .map((frame, index) => `Frame ${index + 1}: ${frame.timestamp.toFixed(1)}s`)
-    .join(", ");
-
-  return `Video file name: ${videoFileName || "uploaded-video"}
-Video duration: ${videoDuration ? `${videoDuration}s` : "not provided"}
-Sampled frame timestamps: ${frameTimestamps || "not provided"}
-Optional context/transcript:
-${context || "No extra context provided."}`;
-}
-
 function describeTextFallbackInput({
   context,
   videoDuration,
@@ -526,26 +509,40 @@ Caption rules:
 - Keep captions safe for public posting.`;
 }
 
-function createVisionPrompt(payload: CaptionRequestPayload) {
-  return `Analyze only the sampled video frames and user-provided context/transcript, then generate catchy short-video captions.
+function createVisionPrompt() {
+  return `Inspect only the supplied sampled video frames and generate four concise, social-media-ready captions.
 
-Vision-specific rules:
-- Use visible scene/action details, clothing, pose, performance style, setting, and on-screen text only when clearly visible.
-- You may describe visible clothing or scene details, such as "wearing a hijab" or "wearing a headscarf", when relevant and clearly visible in the frames.
-- Do not infer religion, ethnicity, nationality, age, identity, beliefs, background, or personal details unless the user explicitly provides them in the context/transcript.
-- You may say "woman wearing a hijab" only if clearly visible. Do not say "Muslim woman" unless the user explicitly provides that.
-- Do not guess age, ethnicity, nationality, religion, personal identity, or background.
-- This app analyzes sampled frames only; it does not analyze audio.
-- Unless the user context/transcript explicitly provides audio details, do not mention voice quality, pitch, singing quality, vocal performance, audio analysis, sound quality, lyrics, speech, tone, vocals, or anything heard.
-- Do not turn visible performance into audio claims. Prefer visual/performance-safe wording such as "Stage presence deployed" or "Confidence compiled successfully."
-- Avoid saying "based on the context", "based on the frames", "the model sees", "AI generated", "Fireworks", or any task/meta language inside caption fields.
-- Captions should be engaging and natural, not robotic.
-- visualSummary should honestly summarize visible scene/action and provided context only.
-- safetyNote should remind the user to review captions and avoid misrepresenting people, events, or context.
+Return ONLY valid JSON. No markdown, explanation, or code fence. Use exactly these keys and no others:
+{
+  "formal": "...",
+  "sarcastic": "...",
+  "humorous_tech": "...",
+  "humorous_non_tech": "...",
+  "visual_summary": "...",
+  "safety_note": "..."
+}
 
-${describeVideo(payload)}
+Rules for all four captions:
+- Use only details that are clearly visible in the sampled frames.
+- Include at least two concrete, clearly visible scene details in every caption, such as objects, clothing, actions, background elements, or readable on-screen text.
+- Do not use the filename, duration, context, transcript, or prior knowledge as evidence for caption details.
+- Do not infer or mention audio, speech, music, voice, pitch, singing, vocals, sound, or anything heard.
+- Do not infer or mention an exact location, identity, nationality, ethnicity, religion, occupation, relationships, age, or emotions.
+- Do not mention time of day or weather unless it is unmistakably visible.
+- Do not claim camera techniques such as timelapse, long exposure, high frame rate, slow motion, or motion blur unless the sampled frames clearly confirm them.
+- Avoid generic wording that could apply to any video.
+- Write exactly one sentence per caption, around 15-30 words.
+- Keep every statement factually grounded in visible evidence and safe for public posting.
+- Do not include task explanations, limitations, or meta language in the four caption fields.
 
-${captionRules()}`;
+Style requirements:
+- formal: professional, clear, and descriptive.
+- sarcastic: dry, witty sarcasm that remains factually grounded and is never rude or cruel.
+- humorous_tech: include a light technology, developer, or AI joke plus at least two real visible scene details.
+- humorous_non_tech: use simple everyday humor plus at least two real visible scene details.
+
+The visual_summary must use only clearly visible information from the sampled frames and must avoid assumptions or inferred details.
+The safety_note should briefly remind the user to review captions before publishing and avoid misrepresenting people or events.`;
 }
 
 function createTextFallbackPrompt(payload: CaptionRequestPayload) {
@@ -708,7 +705,7 @@ async function generateVisionCaptions({
   const content: ChatCompletionContentPart[] = [
     {
       type: "text",
-      text: createVisionPrompt(payload),
+      text: createVisionPrompt(),
     },
     ...payload.frames.slice(0, MAX_FRAMES).map(
       (frame): ChatCompletionContentPart => ({
