@@ -78,7 +78,7 @@ const architectureSteps = [
   },
   {
     title: "Fireworks AI Captioning",
-    description: "Future model call reads frames and user-provided context.",
+    description: "Fireworks Vision reads sampled frames and user-provided context.",
   },
   {
     title: "Style Transformation",
