@@ -33,5 +33,8 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          platforms: linux/amd64
           push: true
-          tags: ghcr.io/kmt9967/captionforge-ai:latest
+          tags: |
+            ghcr.io/kmt9967/captionforge-ai:latest
+            ghcr.io/kmt9967/captionforge-ai:track2-v2

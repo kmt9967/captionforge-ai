@@ -25,7 +25,7 @@ Built for the AMD Developer Hackathon Act II Track 2, the project demonstrates a
 - ESLint
 - lucide-react
 - OpenAI SDK with the Fireworks OpenAI-compatible endpoint
-- Docker multi-stage production build
+- Lightweight Node.js and FFmpeg Docker judging agent
 
 ## Fireworks Vision Flow
 
@@ -94,23 +94,76 @@ FIREWORKS_TEXT_MODEL=accounts/fireworks/models/deepseek-v4-pro
 
 `.env.local` is ignored by git and should never be committed.
 
-## Docker
+## Track 2 Docker Judge
 
-Build the production image:
+The Vercel deployment remains the interactive CaptionForge AI web demo. The root `Dockerfile` is a separate, one-shot Track 2 judging agent: it reads tasks from `/input/tasks.json`, samples each video with FFmpeg, calls the deployed caption API, writes `/output/results.json`, and exits. It never starts the Next.js server and contains no Fireworks or Vercel secrets.
 
-```bash
-docker build -t captionforge-ai .
+The previous production web image is retained in `Dockerfile.web` for reference. Vercel continues to build and host the existing Next.js frontend and `/api/captions` route independently.
+
+### Input Schema
+
+```json
+[
+  {
+    "task_id": "v1",
+    "video_url": "https://example.com/video.mp4",
+    "styles": [
+      "formal",
+      "sarcastic",
+      "humorous_tech",
+      "humorous_non_tech"
+    ]
+  }
+]
 ```
 
-Run the app with runtime environment variables:
+Supported style values are `formal`, `sarcastic`, `humorous_tech`, and `humorous_non_tech`. The result contains every requested supported style.
 
-```bash
-docker run --rm -p 3000:3000 --env-file .env.local captionforge-ai
+### Output Schema
+
+```json
+[
+  {
+    "task_id": "v1",
+    "captions": {
+      "formal": "...",
+      "sarcastic": "...",
+      "humorous_tech": "...",
+      "humorous_non_tech": "..."
+    }
+  }
+]
 ```
 
-Open `http://localhost:3000`.
+### Local Docker Test
 
-Do not bake API keys into the image. Pass secrets at runtime with `--env-file` or your deployment platform's secret manager.
+The repository includes a public boulevard sample at `judge-test/input/tasks.json`.
+
+Build and run it on Linux or macOS:
+
+```bash
+mkdir -p judge-test/output
+docker build --platform linux/amd64 -t captionforge-ai:track2 .
+docker run --rm \
+  -v "$PWD/judge-test/input:/input:ro" \
+  -v "$PWD/judge-test/output:/output" \
+  captionforge-ai:track2
+cat judge-test/output/results.json
+```
+
+PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force judge-test/output | Out-Null
+docker build --platform linux/amd64 -t captionforge-ai:track2 .
+docker run --rm `
+  --mount "type=bind,source=$((Resolve-Path judge-test/input).Path),target=/input,readonly" `
+  --mount "type=bind,source=$((Resolve-Path judge-test/output).Path),target=/output" `
+  captionforge-ai:track2
+Get-Content judge-test/output/results.json
+```
+
+The judge image requires outbound HTTPS access to download task videos and call the deployed CaptionForge API. No API key or `.env` file should be passed into or baked into this image.
 
 ## Demo Workflow
 
