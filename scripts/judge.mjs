@@ -1,9 +1,6 @@
 import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 
 const INPUT_PATH = "/input/tasks.json";
@@ -14,13 +11,17 @@ const CAPTION_API_URL =
   "https://captionforge-ai-omega.vercel.app/api/captions";
 
 const MAX_CONCURRENT_TASKS = 2;
-const DOWNLOAD_TIMEOUT_MS = 60_000;
-const FFPROBE_TIMEOUT_MS = 15_000;
-const FFMPEG_TIMEOUT_MS = 45_000;
-const CAPTION_API_TIMEOUT_MS = 30_000;
+const FFPROBE_TIMEOUT_MS = 10_000;
+const FFMPEG_TIMEOUT_MS = 15_000;
+const CAPTION_API_TIMEOUT_MS = 20_000;
+const CAPTION_RETRY_DELAY_MS = 300;
+const PER_TASK_TIMEOUT_MS = 40_000;
+const GLOBAL_DEADLINE_MS = 8 * 60_000 + 30_000;
+const OUTPUT_RESERVE_MS = 15_000;
+const GLOBAL_WORK_CUTOFF_MS = GLOBAL_DEADLINE_MS - OUTPUT_RESERVE_MS;
+const FRAME_COUNT = 5;
 const MAX_FRAME_DATA_URL_CHARS = 790_000;
 const MAX_TOTAL_FRAME_CHARS = 2_450_000;
-const FRAME_POSITIONS = [0.1, 0.3, 0.5, 0.7, 0.9];
 const SUPPORTED_STYLES = [
   "formal",
   "sarcastic",
@@ -44,31 +45,71 @@ const SAFE_FALLBACK_CAPTIONS = {
   humorous_non_tech:
     "The automatic caption took a break, so this clip is waiting for a human touch.",
 };
-const FRAME_PROFILES = [
-  { width: 640, quality: 5 },
-  { width: 560, quality: 7 },
-  { width: 480, quality: 9 },
-  { width: 400, quality: 12 },
-  { width: 320, quality: 16 },
-  { width: 256, quality: 20 },
-];
+
+class RetryableHttpError extends Error {}
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function createTimeoutController(timeoutMs) {
+function signalError(signal, fallbackMessage) {
+  if (signal?.reason instanceof Error) {
+    return signal.reason;
+  }
+
+  return new Error(fallbackMessage);
+}
+
+function createLinkedTimeout(parentSignal, timeoutMs, timeoutMessage) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const abortFromParent = () => {
+    controller.abort(signalError(parentSignal, "Operation cancelled."));
+  };
+
+  if (parentSignal?.aborted) {
+    abortFromParent();
+  } else {
+    parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  }
+
+  const timer = setTimeout(() => {
+    controller.abort(new Error(timeoutMessage));
+  }, timeoutMs);
   timer.unref();
 
   return {
     signal: controller.signal,
-    clear: () => clearTimeout(timer),
+    clear() {
+      clearTimeout(timer);
+      parentSignal?.removeEventListener("abort", abortFromParent);
+    },
   };
 }
 
-async function runCommand(command, args, timeoutMs) {
+async function abortableDelay(delayMs, signal) {
+  if (signal?.aborted) {
+    throw signalError(signal, "Delay cancelled.");
+  }
+
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signalError(signal, "Delay cancelled."));
+    };
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function runCommand(command, args, timeoutMs, signal) {
+  if (signal?.aborted) {
+    throw signalError(signal, `${command} cancelled.`);
+  }
+
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -76,6 +117,8 @@ async function runCommand(command, args, timeoutMs) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
+    let settled = false;
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -86,19 +129,43 @@ async function runCommand(command, args, timeoutMs) {
       stderr = `${stderr}${chunk}`.slice(-20_000);
     });
 
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      aborted = true;
+      child.kill("SIGKILL");
+    };
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
     }, timeoutMs);
     timer.unref();
+    signal?.addEventListener("abort", onAbort, { once: true });
 
     child.on("error", (error) => {
-      clearTimeout(timer);
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
       reject(error);
     });
 
-    child.on("close", (code, signal) => {
-      clearTimeout(timer);
+    child.on("close", (code, closeSignal) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+
+      if (aborted) {
+        reject(signalError(signal, `${command} cancelled.`));
+        return;
+      }
 
       if (timedOut) {
         reject(new Error(`${command} timed out after ${timeoutMs}ms.`));
@@ -106,7 +173,8 @@ async function runCommand(command, args, timeoutMs) {
       }
 
       if (code !== 0) {
-        const detail = stderr.trim() || `terminated by ${signal || "unknown"}`;
+        const detail =
+          stderr.trim() || `terminated by ${closeSignal || "unknown"}`;
         reject(new Error(`${command} exited with code ${code}: ${detail}`));
         return;
       }
@@ -135,51 +203,22 @@ function normalizeVideoFileName(videoUrl) {
   return safeName || "clip.mp4";
 }
 
-async function downloadVideo(videoUrl, destination) {
-  const timeout = createTimeoutController(DOWNLOAD_TIMEOUT_MS);
-
-  try {
-    const response = await fetch(videoUrl, {
-      redirect: "follow",
-      signal: timeout.signal,
-    });
-
-    if (!response.ok) {
-      throw new Error(`Video download failed with HTTP ${response.status}.`);
-    }
-
-    if (!response.body) {
-      throw new Error("Video download returned an empty response body.");
-    }
-
-    await pipeline(
-      Readable.fromWeb(response.body),
-      createWriteStream(destination, { flags: "wx" }),
-    );
-  } catch (error) {
-    if (timeout.signal.aborted) {
-      throw new Error(`Video download timed out after ${DOWNLOAD_TIMEOUT_MS}ms.`);
-    }
-
-    throw error;
-  } finally {
-    timeout.clear();
-  }
-}
-
-async function probeDuration(videoPath) {
+async function probeDuration(videoUrl, signal) {
   const { stdout } = await runCommand(
     "ffprobe",
     [
       "-v",
       "error",
+      "-rw_timeout",
+      "8000000",
       "-show_entries",
       "format=duration",
       "-of",
       "default=noprint_wrappers=1:nokey=1",
-      videoPath,
+      videoUrl,
     ],
     FFPROBE_TIMEOUT_MS,
+    signal,
   );
   const duration = Number.parseFloat(stdout.trim());
 
@@ -190,13 +229,17 @@ async function probeDuration(videoPath) {
   return duration;
 }
 
-async function extractFrame({
-  framePath,
-  quality,
-  timestamp,
-  videoPath,
-  width,
-}) {
+async function extractRepresentativeFrames(
+  videoUrl,
+  tempDirectory,
+  duration,
+  signal,
+) {
+  const sampleStart = duration * 0.1;
+  const sampleDuration = duration * 0.8;
+  const frameRate = FRAME_COUNT / sampleDuration;
+  const outputPattern = join(tempDirectory, "frame-%02d.jpg");
+
   await runCommand(
     "ffmpeg",
     [
@@ -205,71 +248,53 @@ async function extractFrame({
       "error",
       "-y",
       "-ss",
-      timestamp.toFixed(3),
+      sampleStart.toFixed(3),
+      "-rw_timeout",
+      "12000000",
       "-i",
-      videoPath,
-      "-frames:v",
-      "1",
+      videoUrl,
+      "-t",
+      sampleDuration.toFixed(3),
+      "-an",
       "-vf",
-      `scale='min(${width},iw)':-2`,
+      `fps=${frameRate.toFixed(8)},scale='min(512,iw)':-2`,
+      "-frames:v",
+      String(FRAME_COUNT),
       "-q:v",
-      String(quality),
-      framePath,
+      "8",
+      "-threads",
+      "1",
+      "-start_number",
+      "1",
+      outputPattern,
     ],
     FFMPEG_TIMEOUT_MS,
+    signal,
   );
-}
 
-async function readFramesAsDataUrls(framePaths, timestamps) {
-  const dataUrls = await Promise.all(
-    framePaths.map(async (framePath, index) => {
-      const image = await readFile(framePath);
-      return {
-        dataUrl: `data:image/jpeg;base64,${image.toString("base64")}`,
-        timestamp: Math.round(timestamps[index] * 10) / 10,
-      };
-    }),
+  const framePaths = Array.from({ length: FRAME_COUNT }, (_, index) =>
+    join(tempDirectory, `frame-${String(index + 1).padStart(2, "0")}.jpg`),
   );
-  const totalChars = dataUrls.reduce(
+  const images = await Promise.all(framePaths.map((path) => readFile(path)));
+  const interval = sampleDuration / FRAME_COUNT;
+  const frames = images.map((image, index) => ({
+    dataUrl: `data:image/jpeg;base64,${image.toString("base64")}`,
+    timestamp:
+      Math.round((sampleStart + interval * (index + 0.5)) * 10) / 10,
+  }));
+  const totalChars = frames.reduce(
     (total, frame) => total + frame.dataUrl.length,
     0,
   );
-  const framesFit = dataUrls.every(
-    (frame) => frame.dataUrl.length <= MAX_FRAME_DATA_URL_CHARS,
-  );
 
-  return { dataUrls, framesFit, totalChars };
-}
-
-async function extractRepresentativeFrames(videoPath, tempDirectory, duration) {
-  const timestamps = FRAME_POSITIONS.map((position) => duration * position);
-  const framePaths = FRAME_POSITIONS.map((_, index) =>
-    join(tempDirectory, `frame-${index + 1}.jpg`),
-  );
-
-  for (const profile of FRAME_PROFILES) {
-    await Promise.all(
-      framePaths.map((framePath) => rm(framePath, { force: true })),
-    );
-
-    for (let index = 0; index < framePaths.length; index += 1) {
-      await extractFrame({
-        framePath: framePaths[index],
-        quality: profile.quality,
-        timestamp: timestamps[index],
-        videoPath,
-        width: profile.width,
-      });
-    }
-
-    const encoded = await readFramesAsDataUrls(framePaths, timestamps);
-
-    if (encoded.framesFit && encoded.totalChars < MAX_TOTAL_FRAME_CHARS) {
-      return encoded.dataUrls;
-    }
+  if (
+    frames.some((frame) => frame.dataUrl.length > MAX_FRAME_DATA_URL_CHARS) ||
+    totalChars >= MAX_TOTAL_FRAME_CHARS
+  ) {
+    throw new Error("Five compressed frames exceed the caption API limits.");
   }
 
-  throw new Error("Five compressed frames could not fit within the API limits.");
+  return frames;
 }
 
 function requestedStyles(task) {
@@ -312,8 +337,21 @@ function validateTask(task) {
   };
 }
 
+function preservedTaskId(task, index) {
+  return task && typeof task === "object" && "task_id" in task
+    ? task.task_id
+    : `task-${index + 1}`;
+}
+
 function selectCaptions(styles, captions) {
   return Object.fromEntries(styles.map((style) => [style, captions[style]]));
+}
+
+function fallbackResult(task, index) {
+  return {
+    task_id: preservedTaskId(task, index),
+    captions: selectCaptions(requestedStyles(task), SAFE_FALLBACK_CAPTIONS),
+  };
 }
 
 function mapApiCaptions(styles, response) {
@@ -337,76 +375,96 @@ function mapApiCaptions(styles, response) {
   return captions;
 }
 
-async function requestCaptions(payload, styles) {
-  const requestBody = JSON.stringify(payload);
-  let lastError;
+async function makeCaptionRequest(requestBody, styles, taskSignal) {
+  const timeout = createLinkedTimeout(
+    taskSignal,
+    CAPTION_API_TIMEOUT_MS,
+    `Caption API timed out after ${CAPTION_API_TIMEOUT_MS}ms.`,
+  );
 
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    const timeout = createTimeoutController(CAPTION_API_TIMEOUT_MS);
+  try {
+    const response = await fetch(CAPTION_API_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: requestBody,
+      signal: timeout.signal,
+    });
+    const responseText = await response.text();
+
+    if (response.status === 429 || response.status >= 500) {
+      throw new RetryableHttpError(
+        `Caption API returned HTTP ${response.status}: ${responseText.slice(0, 300)}`,
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        `Caption API returned HTTP ${response.status}: ${responseText.slice(0, 300)}`,
+      );
+    }
+
+    let responseBody;
 
     try {
-      const response = await fetch(CAPTION_API_URL, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: requestBody,
-        signal: timeout.signal,
-      });
-      const responseText = await response.text();
-
-      if (!response.ok) {
-        throw new Error(
-          `Caption API returned HTTP ${response.status}: ${responseText.slice(0, 300)}`,
-        );
-      }
-
-      let responseBody;
-
-      try {
-        responseBody = JSON.parse(responseText);
-      } catch {
-        throw new Error("Caption API returned invalid JSON.");
-      }
-
-      return mapApiCaptions(styles, responseBody);
-    } catch (error) {
-      lastError = timeout.signal.aborted
-        ? new Error(`Caption API timed out after ${CAPTION_API_TIMEOUT_MS}ms.`)
-        : error;
-
-      if (attempt === 1) {
-        console.warn(`Caption API attempt 1 failed; retrying once: ${errorMessage(lastError)}`);
-      }
-    } finally {
-      timeout.clear();
+      responseBody = JSON.parse(responseText);
+    } catch {
+      throw new Error("Caption API returned invalid JSON.");
     }
-  }
 
-  throw lastError || new Error("Caption API failed after one retry.");
+    return mapApiCaptions(styles, responseBody);
+  } catch (error) {
+    if (timeout.signal.aborted) {
+      throw signalError(timeout.signal, "Caption API request cancelled.");
+    }
+
+    throw error;
+  } finally {
+    timeout.clear();
+  }
 }
 
-async function processTask(rawTask, index) {
-  const preservedTaskId =
-    rawTask && typeof rawTask === "object" && "task_id" in rawTask
-      ? rawTask.task_id
-      : `task-${index + 1}`;
-  const fallbackStyles = requestedStyles(rawTask);
+async function requestCaptions(payload, styles, taskSignal) {
+  const requestBody = JSON.stringify(payload);
+
+  try {
+    return await makeCaptionRequest(requestBody, styles, taskSignal);
+  } catch (error) {
+    if (!(error instanceof RetryableHttpError)) {
+      throw error;
+    }
+
+    console.warn(
+      `Caption API returned a retryable status; retrying once: ${errorMessage(error)}`,
+    );
+    await abortableDelay(CAPTION_RETRY_DELAY_MS, taskSignal);
+    return makeCaptionRequest(requestBody, styles, taskSignal);
+  }
+}
+
+async function processTask(rawTask, index, globalSignal) {
+  if (globalSignal.aborted) {
+    return fallbackResult(rawTask, index);
+  }
+
+  const taskTimeout = createLinkedTimeout(
+    globalSignal,
+    PER_TASK_TIMEOUT_MS,
+    `Task timed out after ${PER_TASK_TIMEOUT_MS}ms.`,
+  );
   let tempDirectory;
 
   try {
     const task = validateTask(rawTask);
     const videoFileName = normalizeVideoFileName(task.videoUrl);
     tempDirectory = await mkdtemp(join(tmpdir(), "captionforge-judge-"));
-    const videoExtension = extname(videoFileName) || ".mp4";
-    const videoPath = join(tempDirectory, `video${videoExtension}`);
 
-    console.log(`[${task.taskId}] Downloading video.`);
-    await downloadVideo(task.videoUrl, videoPath);
-
-    const duration = await probeDuration(videoPath);
+    console.log(`[${task.taskId}] Probing remote video.`);
+    const duration = await probeDuration(task.videoUrl, taskTimeout.signal);
     const frames = await extractRepresentativeFrames(
-      videoPath,
+      task.videoUrl,
       tempDirectory,
       duration,
+      taskTimeout.signal,
     );
     const captions = await requestCaptions(
       {
@@ -416,17 +474,19 @@ async function processTask(rawTask, index) {
         videoDuration: Math.round(duration * 10) / 10,
       },
       task.styles,
+      taskTimeout.signal,
     );
 
     console.log(`[${task.taskId}] Completed.`);
     return { task_id: task.taskId, captions };
   } catch (error) {
-    console.error(`[${String(preservedTaskId)}] Task failed: ${errorMessage(error)}`);
-    return {
-      task_id: preservedTaskId,
-      captions: selectCaptions(fallbackStyles, SAFE_FALLBACK_CAPTIONS),
-    };
+    console.error(
+      `[${String(preservedTaskId(rawTask, index))}] Task failed: ${errorMessage(error)}`,
+    );
+    return fallbackResult(rawTask, index);
   } finally {
+    taskTimeout.clear();
+
     if (tempDirectory) {
       await rm(tempDirectory, { recursive: true, force: true }).catch((error) => {
         console.warn(`Temporary file cleanup failed: ${errorMessage(error)}`);
@@ -435,24 +495,34 @@ async function processTask(rawTask, index) {
   }
 }
 
-async function processTasks(tasks) {
-  const results = new Array(tasks.length);
+async function processTasksInto(tasks, results, globalSignal) {
   let nextIndex = 0;
 
   async function worker() {
     while (nextIndex < tasks.length) {
       const index = nextIndex;
       nextIndex += 1;
-      results[index] = await processTask(tasks[index], index);
+      results[index] = globalSignal.aborted
+        ? fallbackResult(tasks[index], index)
+        : await processTask(tasks[index], index, globalSignal);
     }
   }
 
   const workerCount = Math.min(MAX_CONCURRENT_TASKS, tasks.length);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return results;
+}
+
+async function writeResults(results) {
+  try {
+    await writeFile(OUTPUT_TEMP_PATH, `${JSON.stringify(results, null, 2)}\n`, "utf8");
+    await rename(OUTPUT_TEMP_PATH, OUTPUT_PATH);
+  } catch (error) {
+    throw new Error(`Unable to write results: ${errorMessage(error)}`);
+  }
 }
 
 async function main() {
+  const runStartedAt = Date.now();
   let tasks;
 
   try {
@@ -472,16 +542,45 @@ async function main() {
     throw new Error(`Unable to create output directory: ${errorMessage(error)}`);
   }
 
-  const results = await processTasks(tasks);
+  const results = new Array(tasks.length);
+  const globalController = new AbortController();
+  const processing = processTasksInto(tasks, results, globalController.signal);
+  const cutoffDelay = Math.max(
+    0,
+    GLOBAL_WORK_CUTOFF_MS - (Date.now() - runStartedAt),
+  );
+  let cutoffTimer;
+  const cutoff = new Promise((resolve) => {
+    cutoffTimer = setTimeout(() => {
+      console.warn(
+        "Global deadline is close; cancelling unfinished tasks and writing fallbacks.",
+      );
+      globalController.abort(new Error("Global judging deadline reached."));
+      resolve("deadline");
+    }, cutoffDelay);
+  });
+  const processingOutcome = processing
+    .then(() => "complete")
+    .catch((error) => {
+      console.error(`Unexpected processing failure: ${errorMessage(error)}`);
+      globalController.abort(error);
+      return "processing-error";
+    });
+  const outcome = await Promise.race([processingOutcome, cutoff]);
 
-  try {
-    await writeFile(OUTPUT_TEMP_PATH, `${JSON.stringify(results, null, 2)}\n`, "utf8");
-    await rename(OUTPUT_TEMP_PATH, OUTPUT_PATH);
-  } catch (error) {
-    throw new Error(`Unable to write results: ${errorMessage(error)}`);
+  if (outcome !== "deadline") {
+    clearTimeout(cutoffTimer);
   }
 
-  console.log(`Wrote ${results.length} result(s) to ${OUTPUT_PATH}.`);
+  const finalResults = results.map(
+    (result, index) => result || fallbackResult(tasks[index], index),
+  );
+  await writeResults(finalResults);
+  console.log(`Wrote ${finalResults.length} result(s) to ${OUTPUT_PATH}.`);
+
+  if (outcome !== "complete") {
+    process.exit(0);
+  }
 }
 
 main().catch((error) => {
