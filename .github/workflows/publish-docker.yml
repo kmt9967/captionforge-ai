@@ -51,10 +51,14 @@ jobs:
             "humorous_tech",
             "humorous_non_tech",
           ];
+          const technicalConcept =
+            /\b(algorithm|cpu|gpu|code|server|update|loading|deployment|bug|bandwidth|debug)\b/i;
 
           if (!Array.isArray(results) || results.length !== 1) {
             throw new Error("Smoke test must produce exactly one result.");
           }
+
+          const normalizedCaptions = [];
 
           for (const key of requiredKeys) {
             const caption = results[0]?.captions?.[key];
@@ -62,6 +66,20 @@ jobs:
             if (typeof caption !== "string" || !caption.trim()) {
               throw new Error(`Smoke test output is missing ${key}.`);
             }
+
+            if (caption.length > 200) {
+              throw new Error(`Smoke test output exceeds 200 characters for ${key}.`);
+            }
+
+            normalizedCaptions.push(caption.trim().toLowerCase());
+          }
+
+          if (new Set(normalizedCaptions).size !== requiredKeys.length) {
+            throw new Error("Smoke test captions must be distinct.");
+          }
+
+          if (!technicalConcept.test(results[0].captions.humorous_tech)) {
+            throw new Error("Smoke test humorous_tech caption lacks a technical concept.");
           }
 
           console.log("Track 2 smoke-test output is valid.");
@@ -83,4 +101,4 @@ jobs:
           push: true
           tags: |
             ghcr.io/kmt9967/captionforge-ai:latest
-            ghcr.io/kmt9967/captionforge-ai:track2-v3
+            ghcr.io/kmt9967/captionforge-ai:track2-v4

@@ -8,12 +8,12 @@ const OUTPUT_DIRECTORY = "/output";
 const OUTPUT_TEMP_PATH = join(OUTPUT_DIRECTORY, "results.tmp.json");
 const OUTPUT_PATH = join(OUTPUT_DIRECTORY, "results.json");
 const CAPTION_API_URL =
-  "https://captionforge-ai-omega.vercel.app/api/captions";
+  "https://captionforge-ai-omega.vercel.app/api/judge-captions";
 
 const MAX_CONCURRENT_TASKS = 2;
 const FFPROBE_TIMEOUT_MS = 10_000;
 const FFMPEG_TIMEOUT_MS = 15_000;
-const CAPTION_API_TIMEOUT_MS = 20_000;
+const CAPTION_API_TIMEOUT_MS = 26_000;
 const CAPTION_RETRY_DELAY_MS = 300;
 const PER_TASK_TIMEOUT_MS = 40_000;
 const GLOBAL_DEADLINE_MS = 8 * 60_000 + 30_000;
@@ -32,8 +32,8 @@ const SUPPORTED_STYLE_SET = new Set(SUPPORTED_STYLES);
 const API_RESPONSE_KEYS = {
   formal: "formal",
   sarcastic: "sarcastic",
-  humorous_tech: "humorousTech",
-  humorous_non_tech: "humorousNonTech",
+  humorous_tech: "humorous_tech",
+  humorous_non_tech: "humorous_non_tech",
 };
 const SAFE_FALLBACK_CAPTIONS = {
   formal:
@@ -41,7 +41,7 @@ const SAFE_FALLBACK_CAPTIONS = {
   sarcastic:
     "The caption service missed its cue, so human review gets the spotlight.",
   humorous_tech:
-    "The caption pipeline timed out gracefully; manual review is now the most reliable feature.",
+    "The caption server timed out gracefully, so manual review is now the most reliable feature in this deployment.",
   humorous_non_tech:
     "The automatic caption took a break, so this clip is waiting for a human touch.",
 };
